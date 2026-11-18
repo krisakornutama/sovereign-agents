@@ -38,6 +38,37 @@ const report = await gate.verifyHistory(planner.id); // every signature and prev
 
 Nothing outside the registry can ever run, and an action cannot be silently redefined — a second `register()` for the same name throws.
 
+## Capability tokens: permissions that are signed, scoped and expire
+
+`run()` takes scopes from whoever calls it, which is fine inside one trusted process and wrong as soon as an agent can choose its own arguments. `runWithCapability()` removes that trust: the actor and its scopes come from a **capability token**, which is nothing more than a `sovereign-attest` receipt (`agent.capability.issued`) signed by a pinned issuer.
+
+```ts
+// The issuer decides: this token is for agent:planner, only writes, only for 15 minutes.
+const token = await gate.issueCapability({
+  subject: 'agent:planner',
+  scopes: ['notes:write'],
+  actions: ['notes.create'], // optional narrowing, even inside the scopes
+  expiresAt: Date.now() + 15 * 60_000,
+});
+
+await gate.runWithCapability(token.receipt, 'notes.create', { text: 'self-hosted' }); // runs
+await gate.runWithCapability(token.receipt, 'notes.delete', { id: 'note-1' }); // missing-scope, nothing ran
+
+await gate.revokeCapability(token.receipt, 'rotation'); // a receipt, not a mutable flag
+```
+
+Every refusal is itself an `agent.action.denied` receipt carrying the reason and the token id, so "the agent tried something it was not allowed to do" is evidence, not a log line. Tokens verify offline from the receipt alone: pin the issuer key and `openCapability(token, { publicKey })` tells you what it grants without a gate, a registry or a network.
+
+What the gate checks, in order, before a handler sees `args`:
+
+1. the token is a receipt signed by a **pinned issuer** (the gate's own key, plus anything in `capabilityIssuers`) — an unpinned key is `foreign-issuer`, never "unknown but fine";
+2. it is inside its validity window (`capability-not-yet-valid`, `expired-capability`);
+3. it has not been revoked (`revoked-capability`, read from its own revocation chain);
+4. the action is in the token's `actions` list, when one is set (`out-of-scope-action`);
+5. the token's scopes cover every scope the action requires (`missing-scope`).
+
+The actor for the run is the token's `subject`. A caller cannot pass an id, so a token for `agent:planner` cannot be spent as `agent:finance`.
+
 ## What the gate guarantees
 
 | Guarantee            | How                                                                                                                                                                |
@@ -75,23 +106,30 @@ The body above is signed and wrapped by `sovereign-attest`; `id` is the sha256 o
 
 ## API
 
-| Export                                               | What it does                                                                                                                                       |
-| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `AgentGate.open({ vault, keyId?, now?, onDenied? })` | Loads or creates the signing key inside the vault and returns the gate                                                                             |
-| `gate.register(name, handler, policy?)`              | Adds one action to the allow-list; `policy` is `{ scopes?, mutating?, description? }`                                                              |
-| `gate.run(principal, action, args?)`                 | Policy check → `requested` receipt → handler → `completed`/`failed` receipt                                                                        |
-| `gate.actions()`                                     | The sorted allow-list — what this gate is willing to do at all                                                                                     |
-| `gate.history(actor)` / `gate.verifyHistory(actor)`  | Verified chain for one actor, oldest first, plus head and count                                                                                    |
-| `gate.verify(receipt)`                               | Verifies one receipt from the wire against the gate's pinned key                                                                                   |
-| `gate.anchor(log)` / `gate.checkAnchor(log)`         | Anchors the vault root and later detects rollback of old history                                                                                   |
-| `AgentsError` codes                                  | `invalid-principal`, `invalid-action`, `unknown-action`, `missing-scope`, `duplicate-action`, `invalid-args`, `receipt-required`, `handler-failed` |
+| Export                                               | What it does                                                                                                                                                                                                                                                       |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `AgentGate.open({ vault, keyId?, now?, onDenied? })` | Loads or creates the signing key inside the vault and returns the gate                                                                                                                                                                                             |
+| `gate.register(name, handler, policy?)`              | Adds one action to the allow-list; `policy` is `{ scopes?, mutating?, description? }`                                                                                                                                                                              |
+| `gate.run(principal, action, args?)`                 | Policy check → `requested` receipt → handler → `completed`/`failed` receipt                                                                                                                                                                                        |
+| `gate.actions()`                                     | The sorted allow-list — what this gate is willing to do at all                                                                                                                                                                                                     |
+| `gate.history(actor)` / `gate.verifyHistory(actor)`  | Verified chain for one actor, oldest first, plus head and count                                                                                                                                                                                                    |
+| `gate.verify(receipt)`                               | Verifies one receipt from the wire against the gate's pinned key                                                                                                                                                                                                   |
+| `gate.issueCapability(grant)`                        | Seals a signed token for `{ subject, scopes, actions?, notBefore?, expiresAt }` and returns it as a `Capability`                                                                                                                                                   |
+| `gate.verifyCapability(token)`                       | Verifies a token against the pinned issuers and returns its grant                                                                                                                                                                                                  |
+| `gate.runWithCapability(token, action, args?)`       | Same receipt-first path, with actor and scopes taken from the token                                                                                                                                                                                                |
+| `gate.revokeCapability(token, reason?)`              | Seals `agent.capability.revoked`; the token is dead from that moment                                                                                                                                                                                               |
+| `gate.capabilityState(token)`                        | Verifies the revocation chain: `{ revoked, at, receipt }`                                                                                                                                                                                                          |
+| `gate.anchor(log)` / `gate.checkAnchor(log)`         | Anchors the vault root and later detects rollback of old history                                                                                                                                                                                                   |
+| `AgentsError` codes                                  | `invalid-principal`, `invalid-action`, `unknown-action`, `missing-scope`, `invalid-capability`, `foreign-issuer`, `capability-not-yet-valid`, `expired-capability`, `revoked-capability`, `duplicate-action`, `invalid-args`, `receipt-required`, `handler-failed` |
 
 `onDenied` gives an operator a live hook (alerting, metrics). A throwing observer cannot change the verdict.
 
 ## Limitations (deliberate, milestone 1)
 
 - **One writer per vault.** The gate serialises chains _inside one process_; two processes writing the same vault can interleave heads. Cross-process sequencing arrives with `sovereign-fabric`.
-- **Policy is static.** Scopes are declared at `register()` time. Delegation, expiry and per-tenant policy need a policy source that is itself receipted.
+- **Policy is static per action.** Scopes are declared at `register()` time; a capability token narrows them but cannot invent new ones. Delegation (a token that mints tokens) is deliberately absent: an issuer list is a pin, not a chain of trust.
+- **Revocation is only as fresh as the reader.** `capabilityState()` reads the local vault; a gate that has never seen the revocation receipt still accepts the token. Anchor and replicate the revocation chain for the guarantee to travel.
+- **A token is a bearer credential.** Whoever holds the receipt can spend it until it expires or is revoked. Keep it out of logs (it contains no payload, only the grant) and prefer short lifetimes over clever storage.
 - **Evidence, not prevention.** The gate proves what ran; it cannot stop a component that bypasses it. Modules that mutate data must be reachable only through the gate for the guarantee to bite — that is an architecture rule, not a library feature.
 - **Rollback needs an anchor.** History is only provably complete once `anchor()` published the root somewhere the attacker cannot rewrite. Inside the same vault, a deleted tail looks like a shorter but valid history.
 - **Digests are not payloads.** A receipt proves _which_ request ran, not what it contained. Reproducing an action needs the data from elsewhere.
