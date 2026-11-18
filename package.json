@@ -1,6 +1,6 @@
 {
   "name": "sovereign-agents",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Receipt-first action gate for Sovereign OS agents: every action is Ed25519-signed into a tamper-evident chain before the handler may touch data. Deny-by-default, fail-closed, offline.",
   "type": "module",
   "main": "./dist/index.js",

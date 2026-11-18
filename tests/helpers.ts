@@ -23,10 +23,16 @@ export function tickingClock(start = 1_700_000_000_000): () => number {
   };
 }
 
-export async function makeGate(
-  options: { readonly onDenied?: (record: DenialRecord) => void } = {}
-): Promise<Fixture> {
-  const clock = tickingClock();
+export interface GateSettings {
+  readonly onDenied?: (record: DenialRecord) => void;
+  readonly keyId?: string;
+  readonly issuer?: string;
+  readonly capabilityIssuers?: Readonly<Record<string, string>>;
+  readonly clock?: () => number;
+}
+
+export async function makeGate(options: GateSettings = {}): Promise<Fixture> {
+  const clock = options.clock ?? tickingClock();
   const vault = await Vault.open({
     store: new MemoryBlobStore(),
     masterKey: randomBytes(32),
@@ -46,6 +52,15 @@ export async function makeGate(
     verifyAnchor: (anchor, expectedRoot) => vault.verifyAnchor(anchor as never, expectedRoot),
     pruneOrphans: (options) => vault.pruneOrphans(options),
   };
-  const gate = await AgentGate.open({ vault: proxy, keyId: 'agent-gate', now: clock, ...options });
+  const gate = await AgentGate.open({
+    vault: proxy,
+    keyId: options.keyId ?? 'agent-gate',
+    now: clock,
+    ...(options.onDenied === undefined ? {} : { onDenied: options.onDenied }),
+    ...(options.issuer === undefined ? {} : { issuer: options.issuer }),
+    ...(options.capabilityIssuers === undefined
+      ? {}
+      : { capabilityIssuers: options.capabilityIssuers }),
+  });
   return { vault, gate, faults, clock };
 }
